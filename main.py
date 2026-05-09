@@ -1,51 +1,55 @@
 from flask import Flask, request
-import json
 
 app = Flask(__name__)
 
 GRID = 33
+LOT = 1
 
-orders = []
+positions = []
+
+last_price = None
+
 
 @app.route("/")
 def home():
-    return "BOT RUNNING"
+    return "GRID BOT ACTIVE"
+
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    global orders
+    global last_price, positions
 
     data = request.json
-
-    action = data.get("action")
     price = float(data.get("price"))
-    lot = float(data.get("lot"))
 
-    if action == "BUY":
-        orders.append({
-            "entry": price,
-            "lot": lot
-        })
+    # first time setup
+    if last_price is None:
+        last_price = price
+        positions.append(price)
+        return {"status": "first buy"}
 
-        print(f"BUY at {price}")
+    # BUY condition (down move)
+    if price <= last_price - GRID:
+        positions.append(price)
+        last_price = price
+        print("BUY at", price)
 
-    if len(orders) > 0:
-        last_order = orders[-1]
+    # SELL condition (up move from last buy)
+    if len(positions) > 0:
+        last_buy = positions[-1]
 
-        if price >= last_order["entry"] + GRID:
-            closed = orders.pop()
+        if price >= last_buy + GRID:
+            positions.pop()
+            print("SELL at", price)
 
-            print(f"SELL at {price}")
+    # restart condition
+    if len(positions) == 0:
+        positions.append(price)
+        last_price = price
+        print("RESTART BUY at", price)
 
-    if len(orders) == 0:
-        orders.append({
-            "entry": price,
-            "lot": lot
-        })
+    return {"status": "ok", "positions": len(positions)}
 
-        print(f"REBUY at {price}")
-
-    return {"status": "success"}
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
