@@ -4,6 +4,8 @@ import hashlib
 import hmac
 import time
 import json
+import traceback
+print("BOT FILE LOADED")
 
 # =========================
 # SETTINGS
@@ -155,8 +157,8 @@ while True:
 
             place_order("sell")
 
-    except Exception as e:
-
-        print("ERROR:", e)
+except Exception as e:
+    print("ERROR:", str(e))
+    traceback.print_exc()
 
     time.sleep(5)
