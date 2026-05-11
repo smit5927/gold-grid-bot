@@ -5,6 +5,8 @@ import hmac
 import time
 import json
 import traceback
+import sys
+sys.stdout.reconfigure(line_buffering=True)
 
 # =========================
 # SETTINGS
