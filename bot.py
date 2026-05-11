@@ -17,6 +17,8 @@ LOT_SIZE = 1
 # API KEYS
 API_KEY = os.getenv("DELTA_API_KEY")
 API_SECRET = os.getenv("DELTA_API_SECRET")
+print("API KEY LOADED:", API_KEY is not None)
+print("API SECRET LOADED:", API_SECRET is not None)
 
 # DELTA INDIA API
 BASE_URL = "https://api.india.delta.exchange"
