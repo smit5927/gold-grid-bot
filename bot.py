@@ -5,28 +5,23 @@ import hmac
 import time
 import json
 import traceback
-print("BOT FILE LOADED")
 
 # =========================
 # SETTINGS
 # =========================
 
 GRID = 33
-
-# LOT SIZE
 LOT_SIZE = 1
 
-# API KEYS
+BASE_URL = "https://api.india.delta.exchange"
+SYMBOL = "PAXGUSD"
+
 API_KEY = os.getenv("DELTA_API_KEY")
 API_SECRET = os.getenv("DELTA_API_SECRET")
+
+print("BOT STARTED...")
 print("API KEY LOADED:", API_KEY is not None)
 print("API SECRET LOADED:", API_SECRET is not None)
-
-# DELTA INDIA API
-BASE_URL = "https://api.india.delta.exchange"
-
-# GOLD SYMBOL
-SYMBOL = "PAXGUSD"
 
 # =========================
 
@@ -34,27 +29,21 @@ position = 0
 last_trade_price = None
 
 
-# =========================
-# GET LIVE PRICE
-# =========================
-
 def get_price():
-
     url = f"{BASE_URL}/v2/tickers/{SYMBOL}"
+    r = requests.get(url, timeout=10)
+    data = r.json()
 
-    response = requests.get(url)
+    if data.get("success") is not True:
+        raise Exception("Ticker API failed: " + str(data))
 
-    data = response.json()
+    if data.get("result") is None:
+        raise Exception("Ticker result is None: " + str(data))
 
     return float(data["result"]["close"])
 
 
-# =========================
-# GENERATE SIGNATURE
-# =========================
-
-def generate_signature(message):
-
+def generate_signature(message: str) -> str:
     return hmac.new(
         API_SECRET.encode(),
         message.encode(),
@@ -62,16 +51,9 @@ def generate_signature(message):
     ).hexdigest()
 
 
-# =========================
-# PLACE ORDER
-# =========================
-
-def place_order(side):
-
+def place_order(side: str):
     endpoint = "/v2/orders"
-
     url = BASE_URL + endpoint
-
     timestamp = str(int(time.time()))
 
     payload = {
@@ -83,14 +65,7 @@ def place_order(side):
 
     body = json.dumps(payload)
 
-    # 🔥 CORRECT SIGNATURE FORMAT
-    signature_data = (
-        "POST" +
-        timestamp +
-        endpoint +
-        body
-    )
-
+    signature_data = "POST" + timestamp + endpoint + body
     signature = generate_signature(signature_data)
 
     headers = {
@@ -101,64 +76,42 @@ def place_order(side):
         "signature": signature
     }
 
-    response = requests.post(
-        url,
-        headers=headers,
-        data=body
-    )
-
-    print("ORDER RESPONSE:", response.text)
+    res = requests.post(url, headers=headers, data=body, timeout=10)
+    print("ORDER RESPONSE:", res.text)
 
 
 # =========================
-# GRID BOT
+# MAIN LOOP
 # =========================
-
-print("GRID BOT STARTED...")
 
 while True:
-
     try:
-
         price = get_price()
-
         print("LIVE PRICE:", price)
 
         # FIRST BUY
         if last_trade_price is None:
-
             last_trade_price = price
-
             position = 1
-
             print("FIRST BUY")
-
             place_order("buy")
 
         # BUY EVERY 33 DOWN
         elif price <= last_trade_price - GRID:
-
             position += 1
-
             last_trade_price = price
-
-            print("GRID BUY:", price)
-
+            print("GRID BUY:", price, "POSITION:", position)
             place_order("buy")
 
         # SELL EVERY 33 UP
         elif price >= last_trade_price + GRID and position > 0:
-
             position -= 1
-
             last_trade_price = price
-
-            print("GRID SELL:", price)
-
+            print("GRID SELL:", price, "POSITION:", position)
             place_order("sell")
 
-except Exception as e:
-    print("ERROR:", str(e))
-    traceback.print_exc()
+    except Exception as e:
+        print("ERROR:", str(e))
+        traceback.print_exc()
 
     time.sleep(5)
