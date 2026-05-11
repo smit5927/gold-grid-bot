@@ -114,7 +114,6 @@ def get_last_buy_fill_price():
 
     fills = data.get("result", [])
 
-    # We want LAST BUY price only
     for f in fills:
         if f.get("product_symbol") == SYMBOL and f.get("side") == "buy":
             return float(f.get("price"))
@@ -151,7 +150,7 @@ try:
         print("RECOVERED LAST BUY PRICE:", last_trade_price)
 
     else:
-        print("NO POSITION FOUND -> FIRST BUY WILL HAPPEN")
+        print("NO POSITION FOUND -> WILL AUTO BUY")
 
 except Exception as e:
     print("STARTUP RECOVERY ERROR:", str(e))
@@ -167,9 +166,9 @@ while True:
         price = get_live_price()
         print("LIVE PRICE:", price, "| LAST:", last_trade_price, "| POS:", position)
 
-        # FIRST BUY ONLY if no position
-        if position == 0 and last_trade_price is None:
-            print("FIRST BUY EXECUTING...")
+        # ALWAYS KEEP 1 LOT IN MARKET
+        if position == 0:
+            print("NO POSITION -> AUTO BUY")
             resp = place_market_order("buy")
 
             if resp.get("success") is True:
@@ -177,7 +176,7 @@ while True:
                 position += LOT_SIZE
 
         # GRID BUY
-        elif position >= 0 and price <= last_trade_price - GRID:
+        elif price <= last_trade_price - GRID:
             print("GRID BUY EXECUTING...")
             resp = place_market_order("buy")
 
@@ -185,7 +184,7 @@ while True:
                 last_trade_price = price
                 position += LOT_SIZE
 
-        # GRID SELL (ONLY if position > 0)
+        # GRID SELL
         elif position > 0 and price >= last_trade_price + GRID:
             print("GRID SELL EXECUTING...")
             resp = place_market_order("sell")
