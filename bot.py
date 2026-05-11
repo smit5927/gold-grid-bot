@@ -15,8 +15,8 @@ GRID = 33
 LOT_SIZE = 1
 
 # API KEYS
-API_KEY = "SEz6U00MKgcsV7bQf0ssmCQn8gy4Dq"
-API_SECRET = "kSu0s9wtUBlv5XCvZcthlV5m8uVlDmx0HA9KBNPXIEHuei7VtNiy5cCkuII6"
+API_KEY = os.getenv("DELTA_API_KEY")
+API_SECRET = os.getenv("DELTA_API_SECRET")
 
 # DELTA INDIA API
 BASE_URL = "https://api.india.delta.exchange"
