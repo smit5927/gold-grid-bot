@@ -6,15 +6,11 @@ import hashlib
 import requests
 import traceback
 
-# =========================
-# CONFIG
-# =========================
-
 BASE_URL = "https://api.india.delta.exchange"
 SYMBOL = "PAXGUSD"
 
 GRID = 33
-LOT_SIZE = int(os.getenv("LOT_SIZE", "1"))   # Change lot from Render env
+LOT_SIZE = int(os.getenv("LOT_SIZE", "1"))
 SLEEP_SECONDS = 5
 
 API_KEY = os.getenv("DELTA_API_KEY")
@@ -28,8 +24,6 @@ print("API SECRET LOADED:", API_SECRET is not None)
 print("SYMBOL:", SYMBOL)
 print("GRID:", GRID)
 print("LOT_SIZE:", LOT_SIZE)
-
-# =========================
 
 
 def generate_signature(message: str) -> str:
@@ -52,7 +46,6 @@ def private_get(endpoint: str, params=None):
     url = BASE_URL + full_endpoint
 
     timestamp = str(int(time.time()))
-
     signature_data = "GET" + timestamp + full_endpoint
     signature = generate_signature(signature_data)
 
@@ -101,7 +94,6 @@ def get_live_price():
 
 
 def get_open_position_size():
-    # official endpoint from docs
     data = private_get("/v2/positions/margined")
 
     if data.get("success") is not True:
@@ -114,17 +106,17 @@ def get_open_position_size():
     return 0.0
 
 
-def get_last_fill_price():
-    # official endpoint from docs: GET /fills
-    data = private_get("/v2/fills", params={"page_size": 50})
+def get_last_buy_fill_price():
+    data = private_get("/v2/fills", params={"page_size": 200})
 
     if data.get("success") is not True:
         raise Exception("Fills API failed: " + str(data))
 
     fills = data.get("result", [])
 
+    # We want LAST BUY price only
     for f in fills:
-        if f.get("product_symbol") == SYMBOL:
+        if f.get("product_symbol") == SYMBOL and f.get("side") == "buy":
             return float(f.get("price"))
 
     return None
@@ -148,14 +140,15 @@ def place_market_order(side: str):
 # =========================
 
 last_trade_price = None
+position = 0
 
 try:
-    pos_size = get_open_position_size()
-    print("EXCHANGE POSITION SIZE:", pos_size)
+    position = get_open_position_size()
+    print("EXCHANGE POSITION SIZE:", position)
 
-    if pos_size != 0:
-        last_trade_price = get_last_fill_price()
-        print("RECOVERED LAST FILL PRICE:", last_trade_price)
+    if position > 0:
+        last_trade_price = get_last_buy_fill_price()
+        print("RECOVERED LAST BUY PRICE:", last_trade_price)
 
     else:
         print("NO POSITION FOUND -> FIRST BUY WILL HAPPEN")
@@ -172,31 +165,36 @@ except Exception as e:
 while True:
     try:
         price = get_live_price()
-        print("LIVE PRICE:", price, "| LAST:", last_trade_price)
+        print("LIVE PRICE:", price, "| LAST:", last_trade_price, "| POS:", position)
 
-        # FIRST BUY only if last_trade_price is None
-        if last_trade_price is None:
+        # FIRST BUY ONLY if no position
+        if position == 0 and last_trade_price is None:
             print("FIRST BUY EXECUTING...")
             resp = place_market_order("buy")
 
             if resp.get("success") is True:
                 last_trade_price = price
+                position += LOT_SIZE
 
-        # BUY GRID
-        elif price <= last_trade_price - GRID:
+        # GRID BUY
+        elif position >= 0 and price <= last_trade_price - GRID:
             print("GRID BUY EXECUTING...")
             resp = place_market_order("buy")
 
             if resp.get("success") is True:
                 last_trade_price = price
+                position += LOT_SIZE
 
-        # SELL GRID
-        elif price >= last_trade_price + GRID:
+        # GRID SELL (ONLY if position > 0)
+        elif position > 0 and price >= last_trade_price + GRID:
             print("GRID SELL EXECUTING...")
             resp = place_market_order("sell")
 
             if resp.get("success") is True:
                 last_trade_price = price
+                position -= LOT_SIZE
+                if position < 0:
+                    position = 0
 
     except Exception as e:
         print("RUNTIME ERROR:", str(e))
