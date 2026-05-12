@@ -1,5 +1,5 @@
-print("BOT FILE RUNNING...")
 import os
+import sys
 import time
 import json
 import hmac
@@ -15,21 +15,23 @@ BASE_URL = "https://api.india.delta.exchange"
 SYMBOL = "PAXGUSD"
 
 GRID = 33
-LOT_SIZE = int(os.getenv("LOT_SIZE", "1"))
+LOT_SIZE = float(os.getenv("LOT_SIZE", "1"))
 SLEEP_SECONDS = 5
 
 API_KEY = os.getenv("DELTA_API_KEY")
 API_SECRET = os.getenv("DELTA_API_SECRET")
 
 STATE_FILE = "state.json"
-USER_AGENT = "python-grid-bot"
+USER_AGENT = "python-grid-bot-final"
+
+print("BOT FILE RUNNING...")
+sys.stdout.flush()
 
 print("BOT STARTED...")
-print("API KEY LOADED:", API_KEY is not None)
-print("API SECRET LOADED:", API_SECRET is not None)
 print("SYMBOL:", SYMBOL)
 print("GRID:", GRID)
 print("LOT_SIZE:", LOT_SIZE)
+sys.stdout.flush()
 
 if not API_KEY or not API_SECRET:
     raise Exception("DELTA_API_KEY / DELTA_API_SECRET missing!")
@@ -40,13 +42,21 @@ if not API_KEY or not API_SECRET:
 
 def load_state():
     if not os.path.exists(STATE_FILE):
-        return {"last_trade_price": None}
+        return {
+            "base_price": None,
+            "next_buy": None,
+            "next_sell": None
+        }
 
     try:
         with open(STATE_FILE, "r") as f:
             return json.load(f)
     except:
-        return {"last_trade_price": None}
+        return {
+            "base_price": None,
+            "next_buy": None,
+            "next_sell": None
+        }
 
 
 def save_state(state):
@@ -143,9 +153,6 @@ def get_open_position_size():
 
 
 def get_last_buy_fill_price():
-    """
-    Only last BUY fill price (ignore sell fills)
-    """
     data = private_get("/v2/fills", params={"page_size": 200})
 
     if data.get("success") is not True:
@@ -160,49 +167,45 @@ def get_last_buy_fill_price():
     return None
 
 
-def place_market_order(side: str):
+def place_market_order(side: str, size: float):
     payload = {
         "product_symbol": SYMBOL,
-        "size": LOT_SIZE,
+        "size": size,
         "side": side,
         "order_type": "market_order"
     }
 
     res = private_post("/v2/orders", payload)
     print("ORDER RESPONSE:", res)
+    sys.stdout.flush()
     return res
 
 
 # =========================
-# SAFE RECOVERY LOGIC
+# GRID LEVEL SYSTEM (FIX)
 # =========================
 
-def safe_recover_last_price(state_last, exchange_last_buy, live_price):
-    """
-    Choose best last_trade_price:
-    Priority:
-    1) If state exists and close to market -> use state
-    2) Else use exchange last buy fill
-    3) Else fallback to live price
-    """
-
-    if state_last is not None:
-        # if state_last not crazy far (within 10 grids)
-        if abs(state_last - live_price) <= GRID * 10:
-            return state_last
-
-    if exchange_last_buy is not None:
-        return exchange_last_buy
-
-    return live_price
+def build_levels(base_price):
+    base_price = float(base_price)
+    return {
+        "base_price": base_price,
+        "next_buy": base_price - GRID,
+        "next_sell": base_price + GRID
+    }
 
 
 # =========================
-# STARTUP
+# STARTUP RECOVERY
 # =========================
 
 state = load_state()
-last_trade_price = state.get("last_trade_price")
+
+base_price = state.get("base_price")
+next_buy = state.get("next_buy")
+next_sell = state.get("next_sell")
+
+print("STATE LOADED:", state)
+sys.stdout.flush()
 
 try:
     price = get_live_price()
@@ -210,27 +213,38 @@ try:
 
     print("STARTUP LIVE PRICE:", price)
     print("STARTUP POS SIZE:", pos_size)
-    print("STATE LAST PRICE:", last_trade_price)
+    sys.stdout.flush()
 
     if pos_size > 0:
         exchange_last_buy = get_last_buy_fill_price()
         print("EXCHANGE LAST BUY FILL:", exchange_last_buy)
+        sys.stdout.flush()
 
-        last_trade_price = safe_recover_last_price(last_trade_price, exchange_last_buy, price)
-        state["last_trade_price"] = last_trade_price
-        save_state(state)
+        if exchange_last_buy is not None:
+            levels = build_levels(exchange_last_buy)
+            base_price = levels["base_price"]
+            next_buy = levels["next_buy"]
+            next_sell = levels["next_sell"]
 
-        print("FINAL RECOVERED LAST PRICE:", last_trade_price)
+            state["base_price"] = base_price
+            state["next_buy"] = next_buy
+            state["next_sell"] = next_sell
+            save_state(state)
+
+            print("RECOVERED LEVELS:", state)
+            sys.stdout.flush()
 
     else:
-        print("NO POSITION FOUND -> BOT WILL WAIT FOR MANUAL BUY")
-        last_trade_price = None
-        state["last_trade_price"] = None
+        print("NO POSITION FOUND -> BOT WAITING FOR MANUAL BUY")
+        state["base_price"] = None
+        state["next_buy"] = None
+        state["next_sell"] = None
         save_state(state)
 
 except Exception as e:
     print("STARTUP ERROR:", str(e))
     traceback.print_exc()
+    sys.stdout.flush()
 
 
 # =========================
@@ -242,58 +256,93 @@ while True:
         price = get_live_price()
         pos_size = get_open_position_size()
 
-        print("LIVE PRICE:", price, "| LAST:", last_trade_price, "| POS:", pos_size)
+        print(f"LIVE PRICE: {price} | POS: {pos_size} | NEXT_BUY: {next_buy} | NEXT_SELL: {next_sell}")
+        sys.stdout.flush()
 
-        # if no position -> pause
-        if pos_size == 0:
-            last_trade_price = None
-            state["last_trade_price"] = None
+        # if no position -> reset
+        if pos_size <= 0:
+            base_price = None
+            next_buy = None
+            next_sell = None
+            state["base_price"] = None
+            state["next_buy"] = None
+            state["next_sell"] = None
             save_state(state)
             time.sleep(SLEEP_SECONDS)
             continue
 
-        # if last_trade_price missing -> recover from fills
-        if last_trade_price is None:
+        # if missing levels -> recover from exchange fill
+        if base_price is None or next_buy is None or next_sell is None:
             exchange_last_buy = get_last_buy_fill_price()
             if exchange_last_buy is not None:
-                last_trade_price = exchange_last_buy
-                state["last_trade_price"] = last_trade_price
+                levels = build_levels(exchange_last_buy)
+                base_price = levels["base_price"]
+                next_buy = levels["next_buy"]
+                next_sell = levels["next_sell"]
+
+                state["base_price"] = base_price
+                state["next_buy"] = next_buy
+                state["next_sell"] = next_sell
                 save_state(state)
-                print("RECOVERED LAST PRICE DURING RUN:", last_trade_price)
+
+                print("LEVELS RECOVERED DURING RUN:", state)
+                sys.stdout.flush()
+
             time.sleep(SLEEP_SECONDS)
             continue
 
-        # BUY GRID
-        if price <= last_trade_price - GRID:
+        # =========================
+        # GRID BUY (FIXED)
+        # =========================
+        if price <= next_buy:
             print("GRID BUY EXECUTING...")
-            resp = place_market_order("buy")
+            sys.stdout.flush()
+
+            resp = place_market_order("buy", LOT_SIZE)
 
             if resp.get("success") is True:
-                # use real executed fill price from exchange
-                new_fill = get_last_buy_fill_price()
-                if new_fill:
-                    last_trade_price = new_fill
-                else:
-                    last_trade_price = price
+                fill = get_last_buy_fill_price()
+                if fill is None:
+                    fill = price
 
-                state["last_trade_price"] = last_trade_price
+                # after buy shift grid down by 1 step only
+                base_price = float(fill)
+                next_buy = base_price - GRID
+                next_sell = base_price + GRID
+
+                state["base_price"] = base_price
+                state["next_buy"] = next_buy
+                state["next_sell"] = next_sell
                 save_state(state)
-                print("UPDATED LAST AFTER BUY:", last_trade_price)
 
-        # SELL GRID
-        elif price >= last_trade_price + GRID:
+                print("BUY DONE -> UPDATED LEVELS:", state)
+                sys.stdout.flush()
+
+        # =========================
+        # GRID SELL (FIXED)
+        # =========================
+        elif price >= next_sell:
             print("GRID SELL EXECUTING...")
-            resp = place_market_order("sell")
+            sys.stdout.flush()
+
+            resp = place_market_order("sell", LOT_SIZE)
 
             if resp.get("success") is True:
-                # after sell, keep last_trade_price as sell execution level
-                last_trade_price = price
-                state["last_trade_price"] = last_trade_price
+                base_price = float(price)
+                next_buy = base_price - GRID
+                next_sell = base_price + GRID
+
+                state["base_price"] = base_price
+                state["next_buy"] = next_buy
+                state["next_sell"] = next_sell
                 save_state(state)
-                print("UPDATED LAST AFTER SELL:", last_trade_price)
+
+                print("SELL DONE -> UPDATED LEVELS:", state)
+                sys.stdout.flush()
 
     except Exception as e:
         print("RUNTIME ERROR:", str(e))
         traceback.print_exc()
+        sys.stdout.flush()
 
     time.sleep(SLEEP_SECONDS)
