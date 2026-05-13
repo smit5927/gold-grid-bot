@@ -6,6 +6,7 @@ import hmac
 import hashlib
 import requests
 import traceback
+from datetime import datetime
 
 # =========================
 # CONFIG
@@ -14,15 +15,17 @@ import traceback
 BASE_URL = "https://api.india.delta.exchange"
 SYMBOL = "PAXGUSD"
 
-GRID = 15   # ✅ CHANGED FROM 33 TO 15
-LOT_SIZE = float(os.getenv("LOT_SIZE", "1"))
-SLEEP_SECONDS = 5
+GRID = float(os.getenv("GRID", "15"))          # FIXED: now 15 points
+LOT_SIZE = float(os.getenv("LOT_SIZE", "1"))   # can change anytime in Render env
+SLEEP_SECONDS = int(os.getenv("SLEEP_SECONDS", "5"))
 
 API_KEY = os.getenv("DELTA_API_KEY")
 API_SECRET = os.getenv("DELTA_API_SECRET")
 
 STATE_FILE = "state.json"
-USER_AGENT = "python-grid-bot-final"
+LOCK_FILE = "bot.lock"
+
+USER_AGENT = "gold-grid-bot-ultra-stable"
 
 print("BOT FILE RUNNING...")
 sys.stdout.flush()
@@ -31,32 +34,69 @@ print("BOT STARTED...")
 print("SYMBOL:", SYMBOL)
 print("GRID:", GRID)
 print("LOT_SIZE:", LOT_SIZE)
+print("SLEEP_SECONDS:", SLEEP_SECONDS)
 sys.stdout.flush()
 
 if not API_KEY or not API_SECRET:
     raise Exception("DELTA_API_KEY / DELTA_API_SECRET missing!")
 
 # =========================
-# STATE
+# LOCK SYSTEM (NO DUPLICATE RUN)
 # =========================
+
+def acquire_lock():
+    if os.path.exists(LOCK_FILE):
+        print("LOCK FILE EXISTS -> BOT ALREADY RUNNING. EXITING.")
+        sys.stdout.flush()
+        sys.exit(0)
+
+    with open(LOCK_FILE, "w") as f:
+        f.write(str(os.getpid()))
+
+    print("LOCK ACQUIRED.")
+    sys.stdout.flush()
+
+
+def release_lock():
+    try:
+        if os.path.exists(LOCK_FILE):
+            os.remove(LOCK_FILE)
+    except:
+        pass
+
+
+acquire_lock()
+
+# =========================
+# STATE SYSTEM
+# =========================
+
+def default_state():
+    return {
+        "base_price": None,
+        "next_buy": None,
+        "next_sell": None,
+        "last_action": None,         # "buy" / "sell"
+        "last_action_price": None,
+        "last_order_id": None,
+        "last_fill_check_time": None
+    }
+
 
 def load_state():
     if not os.path.exists(STATE_FILE):
-        return {
-            "base_price": None,
-            "next_buy": None,
-            "next_sell": None
-        }
+        return default_state()
 
     try:
         with open(STATE_FILE, "r") as f:
-            return json.load(f)
+            data = json.load(f)
+
+        # ensure all keys exist
+        d = default_state()
+        d.update(data)
+        return d
     except:
-        return {
-            "base_price": None,
-            "next_buy": None,
-            "next_sell": None
-        }
+        return default_state()
 
 
 def save_state(state):
@@ -64,8 +104,10 @@ def save_state(state):
         json.dump(state, f, indent=2)
 
 
+state = load_state()
+
 # =========================
-# SIGNATURE
+# SIGNATURE HELPERS
 # =========================
 
 def generate_signature(message: str) -> str:
@@ -74,6 +116,13 @@ def generate_signature(message: str) -> str:
         message.encode(),
         hashlib.sha256
     ).hexdigest()
+
+
+def safe_json_response(r):
+    try:
+        return r.json()
+    except:
+        return None
 
 
 def private_get(endpoint: str, params=None):
@@ -99,8 +148,13 @@ def private_get(endpoint: str, params=None):
         "User-Agent": USER_AGENT
     }
 
-    r = requests.get(url, headers=headers, timeout=15)
-    return r.json()
+    r = requests.get(url, headers=headers, timeout=20)
+    data = safe_json_response(r)
+
+    if data is None:
+        raise Exception("PRIVATE GET JSON ERROR: " + r.text)
+
+    return data
 
 
 def private_post(endpoint: str, payload: dict):
@@ -120,8 +174,13 @@ def private_post(endpoint: str, payload: dict):
         "User-Agent": USER_AGENT
     }
 
-    r = requests.post(url, headers=headers, data=body, timeout=15)
-    return r.json()
+    r = requests.post(url, headers=headers, data=body, timeout=20)
+    data = safe_json_response(r)
+
+    if data is None:
+        raise Exception("PRIVATE POST JSON ERROR: " + r.text)
+
+    return data
 
 
 # =========================
@@ -131,7 +190,10 @@ def private_post(endpoint: str, payload: dict):
 def get_live_price():
     url = f"{BASE_URL}/v2/tickers/{SYMBOL}"
     r = requests.get(url, timeout=10)
-    data = r.json()
+    data = safe_json_response(r)
+
+    if data is None:
+        raise Exception("Ticker JSON error: " + r.text)
 
     if data.get("success") is not True:
         raise Exception("Ticker API failed: " + str(data))
@@ -150,6 +212,24 @@ def get_open_position_size():
             return float(p.get("size", 0))
 
     return 0.0
+
+
+def get_last_fill():
+    """
+    Returns latest fill for this symbol (buy or sell)
+    """
+    data = private_get("/v2/fills", params={"page_size": 50})
+
+    if data.get("success") is not True:
+        raise Exception("Fills API failed: " + str(data))
+
+    fills = data.get("result", [])
+
+    for f in fills:
+        if f.get("product_symbol") == SYMBOL:
+            return f
+
+    return None
 
 
 def get_last_buy_fill_price():
@@ -182,7 +262,7 @@ def place_market_order(side: str, size: float):
 
 
 # =========================
-# GRID LEVEL SYSTEM
+# GRID LEVELS
 # =========================
 
 def build_levels(base_price):
@@ -194,15 +274,39 @@ def build_levels(base_price):
     }
 
 
+def update_levels_from_base(base_price):
+    levels = build_levels(base_price)
+    state["base_price"] = levels["base_price"]
+    state["next_buy"] = levels["next_buy"]
+    state["next_sell"] = levels["next_sell"]
+    save_state(state)
+
+
+# =========================
+# SAFE EXECUTION GUARD
+# =========================
+
+def already_executed_same_price(action, price):
+    """
+    Prevent same action at same price twice.
+    """
+    if state.get("last_action") == action and state.get("last_action_price") is not None:
+        if abs(float(state["last_action_price"]) - float(price)) < 0.01:
+            return True
+    return False
+
+
+def mark_action(action, price, order_id=None):
+    state["last_action"] = action
+    state["last_action_price"] = float(price)
+    state["last_order_id"] = order_id
+    state["last_fill_check_time"] = str(datetime.utcnow())
+    save_state(state)
+
+
 # =========================
 # STARTUP RECOVERY
 # =========================
-
-state = load_state()
-
-base_price = state.get("base_price")
-next_buy = state.get("next_buy")
-next_sell = state.get("next_sell")
 
 print("STATE LOADED:", state)
 sys.stdout.flush()
@@ -215,31 +319,23 @@ try:
     print("STARTUP POS SIZE:", pos_size)
     sys.stdout.flush()
 
-    if pos_size > 0:
+    # If position exists but state missing -> rebuild using last buy fill
+    if pos_size > 0 and (state["base_price"] is None or state["next_buy"] is None or state["next_sell"] is None):
         exchange_last_buy = get_last_buy_fill_price()
         print("EXCHANGE LAST BUY FILL:", exchange_last_buy)
         sys.stdout.flush()
 
         if exchange_last_buy is not None:
-            levels = build_levels(exchange_last_buy)
-            base_price = levels["base_price"]
-            next_buy = levels["next_buy"]
-            next_sell = levels["next_sell"]
-
-            state["base_price"] = base_price
-            state["next_buy"] = next_buy
-            state["next_sell"] = next_sell
-            save_state(state)
-
-            print("RECOVERED LEVELS:", state)
+            update_levels_from_base(exchange_last_buy)
+            print("RECOVERED LEVELS FROM EXCHANGE:", state)
             sys.stdout.flush()
 
-    else:
-        print("NO POSITION FOUND -> BOT WAITING FOR MANUAL BUY")
-        state["base_price"] = None
-        state["next_buy"] = None
-        state["next_sell"] = None
+    # If no position -> clear state
+    if pos_size <= 0:
+        state = default_state()
         save_state(state)
+        print("NO POSITION FOUND -> STATE RESET")
+        sys.stdout.flush()
 
 except Exception as e:
     print("STARTUP ERROR:", str(e))
@@ -251,105 +347,116 @@ except Exception as e:
 # MAIN LOOP
 # =========================
 
-while True:
-    try:
-        price = get_live_price()
-        pos_size = get_open_position_size()
+try:
+    while True:
+        try:
+            # Reload env LOT_SIZE live (so Render change works instantly)
+            LOT_SIZE = float(os.getenv("LOT_SIZE", "1"))
 
-        print(f"LIVE PRICE: {price} | POS: {pos_size} | NEXT_BUY: {next_buy} | NEXT_SELL: {next_sell}")
-        sys.stdout.flush()
+            price = get_live_price()
+            pos_size = get_open_position_size()
 
-        # if no position -> reset
-        if pos_size <= 0:
-            base_price = None
-            next_buy = None
-            next_sell = None
-            state["base_price"] = None
-            state["next_buy"] = None
-            state["next_sell"] = None
-            save_state(state)
-            time.sleep(SLEEP_SECONDS)
-            continue
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # if missing levels -> recover from exchange fill
-        if base_price is None or next_buy is None or next_sell is None:
-            exchange_last_buy = get_last_buy_fill_price()
-            if exchange_last_buy is not None:
-                levels = build_levels(exchange_last_buy)
-                base_price = levels["base_price"]
-                next_buy = levels["next_buy"]
-                next_sell = levels["next_sell"]
-
-                state["base_price"] = base_price
-                state["next_buy"] = next_buy
-                state["next_sell"] = next_sell
-                save_state(state)
-
-                print("LEVELS RECOVERED DURING RUN:", state)
-                sys.stdout.flush()
-
-            time.sleep(SLEEP_SECONDS)
-            continue
-
-        # =========================
-        # GRID BUY
-        # =========================
-        if price <= next_buy:
-            print("GRID BUY EXECUTING...")
+            print(f"{now} LIVE PRICE: {price} | POS: {pos_size} | NEXT_BUY: {state.get('next_buy')} | NEXT_SELL: {state.get('next_sell')} | LOT_SIZE: {LOT_SIZE}")
             sys.stdout.flush()
 
-            resp = place_market_order("buy", LOT_SIZE)
-
-            if resp.get("success") is True:
-                fill = get_last_buy_fill_price()
-                if fill is None:
-                    fill = price
-
-                base_price = float(fill)
-                next_buy = base_price - GRID
-                next_sell = base_price + GRID
-
-                state["base_price"] = base_price
-                state["next_buy"] = next_buy
-                state["next_sell"] = next_sell
+            # If no position -> reset grid
+            if pos_size <= 0:
+                state = default_state()
                 save_state(state)
-
-                print("BUY DONE -> UPDATED LEVELS:", state)
-                sys.stdout.flush()
-
-        # =========================
-        # GRID SELL (NO SHORT FIX)
-        # =========================
-        elif price >= next_sell:
-            sell_size = min(float(LOT_SIZE), float(pos_size))  # ✅ SHORT PREVENT FIX
-
-            if sell_size <= 0:
-                print("SELL BLOCKED -> POSITION IS ZERO")
-                sys.stdout.flush()
                 time.sleep(SLEEP_SECONDS)
                 continue
 
-            print(f"GRID SELL EXECUTING... SELL_SIZE={sell_size} (POS={pos_size})")
-            sys.stdout.flush()
+            # If missing levels -> recover from exchange
+            if state["base_price"] is None or state["next_buy"] is None or state["next_sell"] is None:
+                exchange_last_buy = get_last_buy_fill_price()
+                if exchange_last_buy is not None:
+                    update_levels_from_base(exchange_last_buy)
+                    print("LEVELS RECOVERED DURING RUN:", state)
+                    sys.stdout.flush()
+                time.sleep(SLEEP_SECONDS)
+                continue
 
-            resp = place_market_order("sell", sell_size)
+            next_buy = float(state["next_buy"])
+            next_sell = float(state["next_sell"])
 
-            if resp.get("success") is True:
-                base_price = float(price)
-                next_buy = base_price - GRID
-                next_sell = base_price + GRID
+            # =========================
+            # GRID BUY
+            # =========================
+            if price <= next_buy:
 
-                state["base_price"] = base_price
-                state["next_buy"] = next_buy
-                state["next_sell"] = next_sell
-                save_state(state)
+                if already_executed_same_price("buy", next_buy):
+                    print("SKIPPING DUPLICATE BUY AT SAME GRID LEVEL.")
+                    sys.stdout.flush()
+                    time.sleep(SLEEP_SECONDS)
+                    continue
 
-                print("SELL DONE -> UPDATED LEVELS:", state)
+                print("GRID BUY TRIGGERED...")
                 sys.stdout.flush()
 
-    except Exception as e:
-        print("RUNTIME ERROR:", str(e))
-        traceback.print_exc()
-        sys.stdout.flush()
+                resp = place_market_order("buy", LOT_SIZE)
 
-    time.sleep(SLEEP_SECONDS)
+                if resp.get("success") is True:
+                    order_id = resp.get("result", {}).get("id")
+
+                    # confirm fill from exchange
+                    time.sleep(1)
+                    fill = get_last_buy_fill_price()
+                    if fill is None:
+                        fill = price
+
+                    update_levels_from_base(fill)
+                    mark_action("buy", next_buy, order_id)
+
+                    print("BUY CONFIRMED -> UPDATED LEVELS:", state)
+                    sys.stdout.flush()
+
+            # =========================
+            # GRID SELL
+            # =========================
+            elif price >= next_sell:
+
+                if already_executed_same_price("sell", next_sell):
+                    print("SKIPPING DUPLICATE SELL AT SAME GRID LEVEL.")
+                    sys.stdout.flush()
+                    time.sleep(SLEEP_SECONDS)
+                    continue
+
+                # STRICT SELL PROTECTION (NO SHORT)
+                sell_size = min(LOT_SIZE, pos_size)
+
+                if sell_size <= 0:
+                    print("SELL BLOCKED -> POSITION 0 (NO SHORT ALLOWED).")
+                    sys.stdout.flush()
+                    time.sleep(SLEEP_SECONDS)
+                    continue
+
+                print("GRID SELL TRIGGERED... SELL_SIZE:", sell_size)
+                sys.stdout.flush()
+
+                resp = place_market_order("sell", sell_size)
+
+                if resp.get("success") is True:
+                    order_id = resp.get("result", {}).get("id")
+
+                    # after sell, set base = execution price (use current price)
+                    update_levels_from_base(price)
+                    mark_action("sell", next_sell, order_id)
+
+                    print("SELL CONFIRMED -> UPDATED LEVELS:", state)
+                    sys.stdout.flush()
+
+        except Exception as e:
+            print("RUNTIME ERROR:", str(e))
+            traceback.print_exc()
+            sys.stdout.flush()
+
+        time.sleep(SLEEP_SECONDS)
+
+except KeyboardInterrupt:
+    print("BOT STOPPED MANUALLY.")
+    sys.stdout.flush()
+
+finally:
+    release_lock()
