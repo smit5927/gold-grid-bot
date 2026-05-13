@@ -14,7 +14,7 @@ import traceback
 BASE_URL = "https://api.india.delta.exchange"
 SYMBOL = "PAXGUSD"
 
-GRID = 33
+GRID = 15   # ✅ CHANGED FROM 33 TO 15
 LOT_SIZE = float(os.getenv("LOT_SIZE", "1"))
 SLEEP_SECONDS = 5
 
@@ -182,7 +182,7 @@ def place_market_order(side: str, size: float):
 
 
 # =========================
-# GRID LEVEL SYSTEM (FIX)
+# GRID LEVEL SYSTEM
 # =========================
 
 def build_levels(base_price):
@@ -292,7 +292,7 @@ while True:
             continue
 
         # =========================
-        # GRID BUY (FIXED)
+        # GRID BUY
         # =========================
         if price <= next_buy:
             print("GRID BUY EXECUTING...")
@@ -305,7 +305,6 @@ while True:
                 if fill is None:
                     fill = price
 
-                # after buy shift grid down by 1 step only
                 base_price = float(fill)
                 next_buy = base_price - GRID
                 next_sell = base_price + GRID
@@ -319,13 +318,21 @@ while True:
                 sys.stdout.flush()
 
         # =========================
-        # GRID SELL (FIXED)
+        # GRID SELL (NO SHORT FIX)
         # =========================
         elif price >= next_sell:
-            print("GRID SELL EXECUTING...")
+            sell_size = min(float(LOT_SIZE), float(pos_size))  # ✅ SHORT PREVENT FIX
+
+            if sell_size <= 0:
+                print("SELL BLOCKED -> POSITION IS ZERO")
+                sys.stdout.flush()
+                time.sleep(SLEEP_SECONDS)
+                continue
+
+            print(f"GRID SELL EXECUTING... SELL_SIZE={sell_size} (POS={pos_size})")
             sys.stdout.flush()
 
-            resp = place_market_order("sell", LOT_SIZE)
+            resp = place_market_order("sell", sell_size)
 
             if resp.get("success") is True:
                 base_price = float(price)
