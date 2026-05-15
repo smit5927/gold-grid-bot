@@ -15,8 +15,8 @@ from datetime import datetime
 BASE_URL = "https://api.india.delta.exchange"
 SYMBOL = "PAXGUSD"
 
-GRID = float(os.getenv("GRID", "15"))          # FIXED: now 15 points
-LOT_SIZE = float(os.getenv("LOT_SIZE", "1"))   # can change anytime in Render env
+GRID = float(os.getenv("GRID", "15"))
+LOT_SIZE = float(os.getenv("LOT_SIZE", "1"))
 SLEEP_SECONDS = int(os.getenv("SLEEP_SECONDS", "5"))
 
 API_KEY = os.getenv("DELTA_API_KEY")
@@ -25,7 +25,7 @@ API_SECRET = os.getenv("DELTA_API_SECRET")
 STATE_FILE = "state.json"
 LOCK_FILE = "bot.lock"
 
-USER_AGENT = "gold-grid-bot-ultra-stable"
+USER_AGENT = "gold-grid-bot-ultra-stable-v2"
 
 print("BOT FILE RUNNING...")
 sys.stdout.flush()
@@ -41,7 +41,7 @@ if not API_KEY or not API_SECRET:
     raise Exception("DELTA_API_KEY / DELTA_API_SECRET missing!")
 
 # =========================
-# LOCK SYSTEM (NO DUPLICATE RUN)
+# LOCK SYSTEM
 # =========================
 
 def acquire_lock():
@@ -76,10 +76,12 @@ def default_state():
         "base_price": None,
         "next_buy": None,
         "next_sell": None,
-        "last_action": None,         # "buy" / "sell"
+        "last_action": None,
         "last_action_price": None,
         "last_order_id": None,
-        "last_fill_check_time": None
+        "last_fill_id": None,          # NEW: track exchange fill id
+        "last_fill_price": None,
+        "last_fill_side": None
     }
 
 
@@ -91,7 +93,6 @@ def load_state():
         with open(STATE_FILE, "r") as f:
             data = json.load(f)
 
-        # ensure all keys exist
         d = default_state()
         d.update(data)
         return d
@@ -215,9 +216,6 @@ def get_open_position_size():
 
 
 def get_last_fill():
-    """
-    Returns latest fill for this symbol (buy or sell)
-    """
     data = private_get("/v2/fills", params={"page_size": 50})
 
     if data.get("success") is not True:
@@ -283,13 +281,10 @@ def update_levels_from_base(base_price):
 
 
 # =========================
-# SAFE EXECUTION GUARD
+# DUPLICATE ACTION GUARD
 # =========================
 
 def already_executed_same_price(action, price):
-    """
-    Prevent same action at same price twice.
-    """
     if state.get("last_action") == action and state.get("last_action_price") is not None:
         if abs(float(state["last_action_price"]) - float(price)) < 0.01:
             return True
@@ -300,8 +295,49 @@ def mark_action(action, price, order_id=None):
     state["last_action"] = action
     state["last_action_price"] = float(price)
     state["last_order_id"] = order_id
-    state["last_fill_check_time"] = str(datetime.utcnow())
     save_state(state)
+
+
+# =========================
+# MANUAL TRADE SYNC (FIX)
+# =========================
+
+def sync_with_exchange_fills():
+    """
+    If manual trade happened, bot will auto update base_price/levels.
+    """
+    last_fill = get_last_fill()
+    if last_fill is None:
+        return
+
+    fill_id = last_fill.get("id")
+    fill_price = float(last_fill.get("price"))
+    fill_side = last_fill.get("side")
+
+    if fill_id is None:
+        return
+
+    # If new fill detected
+    if state.get("last_fill_id") != fill_id:
+        print("NEW EXCHANGE FILL DETECTED -> SYNCING GRID LEVELS...")
+        print("FILL SIDE:", fill_side, "PRICE:", fill_price, "ID:", fill_id)
+        sys.stdout.flush()
+
+        # update grid base on last fill price
+        update_levels_from_base(fill_price)
+
+        state["last_fill_id"] = fill_id
+        state["last_fill_price"] = fill_price
+        state["last_fill_side"] = fill_side
+        save_state(state)
+
+        # reset duplicate action memory (important)
+        state["last_action"] = None
+        state["last_action_price"] = None
+        save_state(state)
+
+        print("GRID LEVELS UPDATED FROM EXCHANGE FILL:", state)
+        sys.stdout.flush()
 
 
 # =========================
@@ -319,7 +355,6 @@ try:
     print("STARTUP POS SIZE:", pos_size)
     sys.stdout.flush()
 
-    # If position exists but state missing -> rebuild using last buy fill
     if pos_size > 0 and (state["base_price"] is None or state["next_buy"] is None or state["next_sell"] is None):
         exchange_last_buy = get_last_buy_fill_price()
         print("EXCHANGE LAST BUY FILL:", exchange_last_buy)
@@ -330,7 +365,6 @@ try:
             print("RECOVERED LEVELS FROM EXCHANGE:", state)
             sys.stdout.flush()
 
-    # If no position -> clear state
     if pos_size <= 0:
         state = default_state()
         save_state(state)
@@ -350,8 +384,10 @@ except Exception as e:
 try:
     while True:
         try:
-            # Reload env LOT_SIZE live (so Render change works instantly)
             LOT_SIZE = float(os.getenv("LOT_SIZE", "1"))
+
+            # Sync manual fills every loop
+            sync_with_exchange_fills()
 
             price = get_live_price()
             pos_size = get_open_position_size()
@@ -361,14 +397,12 @@ try:
             print(f"{now} LIVE PRICE: {price} | POS: {pos_size} | NEXT_BUY: {state.get('next_buy')} | NEXT_SELL: {state.get('next_sell')} | LOT_SIZE: {LOT_SIZE}")
             sys.stdout.flush()
 
-            # If no position -> reset grid
             if pos_size <= 0:
                 state = default_state()
                 save_state(state)
                 time.sleep(SLEEP_SECONDS)
                 continue
 
-            # If missing levels -> recover from exchange
             if state["base_price"] is None or state["next_buy"] is None or state["next_sell"] is None:
                 exchange_last_buy = get_last_buy_fill_price()
                 if exchange_last_buy is not None:
@@ -400,7 +434,6 @@ try:
                 if resp.get("success") is True:
                     order_id = resp.get("result", {}).get("id")
 
-                    # confirm fill from exchange
                     time.sleep(1)
                     fill = get_last_buy_fill_price()
                     if fill is None:
@@ -423,7 +456,6 @@ try:
                     time.sleep(SLEEP_SECONDS)
                     continue
 
-                # STRICT SELL PROTECTION (NO SHORT)
                 sell_size = min(LOT_SIZE, pos_size)
 
                 if sell_size <= 0:
@@ -440,7 +472,6 @@ try:
                 if resp.get("success") is True:
                     order_id = resp.get("result", {}).get("id")
 
-                    # after sell, set base = execution price (use current price)
                     update_levels_from_base(price)
                     mark_action("sell", next_sell, order_id)
 
